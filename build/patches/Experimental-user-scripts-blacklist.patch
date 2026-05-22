@@ -1,0 +1,237 @@
+--- a/components/user_scripts/browser/user_script_pref_info.h
++++ b/components/user_scripts/browser/user_script_pref_info.h
+@@ -48,6 +48,9 @@
+     const std::string& parser_error() const { return parser_error_; }
+     void set_parser_error(const std::string& parser_error) { parser_error_ = parser_error; }
+ 
++    const std::string& blacklist() const { return blacklist_; }
++    void set_blacklist(const std::string& blacklist) { blacklist_ = blacklist; }
++
+     base::Time install_time;
+     bool enabled;
+ 
+@@ -60,6 +63,7 @@
+     std::string file_path_;
+     std::string url_source_;
+     std::string parser_error_;
++    std::string blacklist_;
+   };
+ };
+ 
+--- a/components/user_scripts/browser/user_script_prefs.cc
++++ b/components/user_scripts/browser/user_script_prefs.cc
+@@ -58,6 +58,7 @@
+ const char kScriptUrlSource[] = "url_source";
+ const char kScriptParserError[] = "parser_error";
+ const char kScriptForceDisabled[] = "force_disabled";
++const char kScriptBlacklist[] = "blacklist";
+ 
+ class PrefUpdate : public ::prefs::ScopedDictionaryPrefUpdate {
+  public:
+@@ -165,6 +166,21 @@
+     scriptInfo->set_parser_error(it->get()->parser_error());
+     scriptInfo->force_disabled = (it->get()->force_disabled());
+ 
++    if (!scriptInfo->blacklist().empty()) {
++      std::vector<std::string> domains = base::SplitString(scriptInfo->blacklist(), ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++      for (const auto& domain : domains) {
++        URLPattern exclude(UserScript::ValidUserScriptSchemes());
++        if (exclude.Parse("*://" + domain + "/*") == URLPattern::ParseResult::kSuccess) {
++          it->get()->add_exclude_url_pattern(exclude);
++        }
++        URLPattern exclude_sub(UserScript::ValidUserScriptSchemes());
++        if (exclude_sub.Parse("*://*." + domain + "/*") == URLPattern::ParseResult::kSuccess) {
++          it->get()->add_exclude_url_pattern(exclude_sub);
++        }
++      }
++    }
++
+     PrefUpdate update(prefs_, key, kUserScriptsList);
+     std::unique_ptr<::prefs::DictionaryValueUpdate> script_dict = update.Get();
+ 
+@@ -176,6 +192,7 @@
+     script_dict->SetString(kScriptUrlSource, scriptInfo->url_source());
+     script_dict->SetString(kScriptParserError, scriptInfo->parser_error());
+     script_dict->SetBoolean(kScriptForceDisabled, scriptInfo->force_disabled);
++    script_dict->SetString(kScriptBlacklist, scriptInfo->blacklist());
+ 
+     std::string install_time_str =
+         base::NumberToString(scriptInfo->install_time.ToInternalValue());
+@@ -232,13 +249,15 @@
+   const std::string* file_path = dict.FindString(kScriptFilePath);
+   const std::string* url_source = dict.FindString(kScriptUrlSource);
+   const std::string* parser_error = dict.FindString(kScriptParserError);
++  const std::string* blacklist = dict.FindString(kScriptBlacklist);
+ 
+   scriptInfo->set_name( name ? *name : "no name" );
+   scriptInfo->set_description( description ? *description : "no description" );
+   scriptInfo->set_version( version ? *version : "no version" );
+   scriptInfo->enabled = dict.FindBool(kScriptIsEnabled).value_or(false);
+   scriptInfo->set_file_path( file_path ? *file_path : "no file path" );
+   scriptInfo->set_url_source( url_source ? *url_source : "" );
+   scriptInfo->set_parser_error( parser_error ? *parser_error : "" );
++  scriptInfo->set_blacklist( blacklist ? *blacklist : "" );
+   scriptInfo->force_disabled = dict.FindBool(kScriptForceDisabled).value_or(false);
+ 
+@@ -265,4 +284,10 @@
+   script_dict->SetBoolean(kScriptIsEnabled, is_enabled);
+ }
+ 
++void UserScriptsPrefs::SetScriptBlacklist(const std::string& script_id, const std::string& blacklist) {
++  PrefUpdate update(prefs_, script_id, kUserScriptsList);
++  std::unique_ptr<::prefs::DictionaryValueUpdate> script_dict = update.Get();
++  script_dict->SetString(kScriptBlacklist, blacklist);
++}
++
+ }
+--- a/components/user_scripts/browser/user_script_prefs.h
++++ b/components/user_scripts/browser/user_script_prefs.h
+@@ -49,6 +49,7 @@
+     std::string GetScriptsInfo();
+     void RemoveScriptFromPrefs(const std::string& script_id);
+     void SetScriptEnabled(const std::string& script_id, bool is_enabled);
++    void SetScriptBlacklist(const std::string& script_id, const std::string& blacklist);
+ 
+     std::unique_ptr<UserScriptsListPrefs::ScriptInfo> CreateScriptInfoFromPrefs(
+         const std::string& script_id) const;
+--- a/components/user_scripts/browser/user_script_loader.cc
++++ b/components/user_scripts/browser/user_script_loader.cc
+@@ -522,6 +522,12 @@
+   StartLoad();
+ }
+ 
++void UserScriptLoader::SetScriptBlacklist(const std::string& script_id, const std::string& blacklist) {
++  if (!prefs_->IsEnabled()) return;
++  prefs_->SetScriptBlacklist(script_id, blacklist);
++  StartLoad();
++}
++
+ void UserScriptLoader::SelectAndAddScriptFromFile(ui::WindowAndroid* nativeWindow) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+ 
+--- a/components/user_scripts/browser/user_script_loader.h
++++ b/components/user_scripts/browser/user_script_loader.h
+@@ -102,6 +102,7 @@
+ 
+   void RemoveScript(const std::string& script_id);
+   void SetScriptEnabled(const std::string& script_id, bool is_enabled);
++  void SetScriptBlacklist(const std::string& script_id, const std::string& blacklist);
+ 
+   void SelectAndAddScriptFromFile(ui::WindowAndroid* wa);
+   void TryToInstall(const base::FilePath& script_path);
+--- a/components/user_scripts/android/user_scripts_bridge.cc
++++ b/components/user_scripts/android/user_scripts_bridge.cc
+@@ -118,6 +118,17 @@
+   client->GetLoader()->SetScriptEnabled(script_key, is_enabled);
+ }
+ 
++static void JNI_UserScriptsBridge_SetScriptBlacklist(
++                    JNIEnv* env,
++                    const JavaRef<jstring>& jscript_key,
++                    const JavaRef<jstring>& jblacklist) {
++  user_scripts::UserScriptsBrowserClient* client = GetUserScriptsBrowserClient();
++  if (client == NULL) return;
++
++  std::string script_key = base::android::ConvertJavaStringToUTF8(jscript_key);
++  std::string blacklist = base::android::ConvertJavaStringToUTF8(jblacklist);
++  client->GetLoader()->SetScriptBlacklist(script_key, blacklist);
++}
++
+ static void JNI_UserScriptsBridge_Reload(
+                     JNIEnv* env) {
+--- a/components/user_scripts/android/java/src/org/chromium/components/user_scripts/UserScriptsBridge.java
++++ b/components/user_scripts/android/java/src/org/chromium/components/user_scripts/UserScriptsBridge.java
+@@ -76,6 +76,10 @@
+         UserScriptsBridgeJni.get().setScriptEnabled(key, enabled);
+     }
+ 
++    public static void SetScriptBlacklist(String key, String blacklist) {
++        UserScriptsBridgeJni.get().setScriptBlacklist(key, blacklist);
++    }
++
+     public static void Reload() {
+         UserScriptsBridgeJni.get().reload();
+     }
+@@ -158,6 +162,7 @@
+                     if(script.has("file_path")) si.FilePath = script.getString("file_path");
+                     if(script.has("url_source")) si.UrlSource = script.getString("url_source");
+                     if(script.has("parser_error")) si.ParserError = script.getString("parser_error");
++                    if(script.has("blacklist")) si.Blacklist = script.getString("blacklist");
+                     if(script.has("force_disabled")) si.ForceDisabled = script.getBoolean("force_disabled");;
+                     si.Enabled = script.getBoolean("enabled");
+                 }
+@@ -198,6 +203,7 @@
+ 
+         void removeScript(String scriptKey);
+         void setScriptEnabled(String scriptKey, boolean enabled);
++        void setScriptBlacklist(String scriptKey, String blacklist);
+ 
+         void reload();
+         void selectAndAddScriptFromFile(WindowAndroid window);
+--- a/components/user_scripts/android/java/src/org/chromium/components/user_scripts/ScriptInfo.java
++++ b/components/user_scripts/android/java/src/org/chromium/components/user_scripts/ScriptInfo.java
+@@ -32,6 +32,7 @@
+ 
+     public String ParserError;
+     public boolean ForceDisabled;
++    public String Blacklist;
+ 
+     public ScriptInfo() {}
+ }
+--- a/components/user_scripts/android/java/src/org/chromium/components/user_scripts/ScriptListPreference.java
++++ b/components/user_scripts/android/java/src/org/chromium/components/user_scripts/ScriptListPreference.java
+@@ -72,6 +72,7 @@
+             menuItems.add(new ListItemBuilder().withTitleRes(R.string.scripts_view_source)
+                     .withEnabled(info.ParserError == null || info.ParserError.isEmpty())
+                     .build());
++            menuItems.add(new ListItemBuilder().withTitleRes(R.string.scripts_blacklist).build());
+ 
+             ListMenu.Delegate delegate = (model, view) -> {
+                 int textId = model.get(ListMenuItemProperties.TITLE_ID);
+@@ -79,6 +80,8 @@
+                     UserScriptsBridge.RemoveScript(info.Key);
+                 } else if (textId == R.string.scripts_view_source) {
+                     UserScriptsBridge.getUtils().openSourceFile(info.Key);
++                } else if (textId == R.string.scripts_blacklist) {
++                    promptBlacklist(info);
+                 }
+             };
+             ((ScriptInfoRowViewHolder) holder)
+@@ -105,6 +108,22 @@
+             }
+             setDisplayedScriptInfo(list);
+         }
++
++        private void promptBlacklist(ScriptInfo info) {
++            android.widget.EditText input = new android.widget.EditText(mContext);
++            input.setText(info.Blacklist != null ? info.Blacklist : "");
++            input.setHint("example.com, test.org");
++
++            new android.app.AlertDialog.Builder(mContext)
++                .setTitle(R.string.scripts_blacklist)
++                .setMessage(R.string.scripts_blacklist_summary)
++                .setView(input)
++                .setPositiveButton(android.R.string.ok, (dialog, which) -> {
++                    UserScriptsBridge.SetScriptBlacklist(info.Key, input.getText().toString());
++                })
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++        }
+     }
+ 
+     private TextView mAddButton;
+--- a/components/user_scripts/strings/userscripts_strings.grdp
++++ b/components/user_scripts/strings/userscripts_strings.grdp
+@@ -40,6 +40,13 @@
+     View source
+   </message>
+ 
++  <message name="IDS_SCRIPTS_BLACKLIST" desc=". [CHAR-LIMIT=32]" formatter_data="android_java">
++    Domain Blacklist
++  </message>
++  <message name="IDS_SCRIPTS_BLACKLIST_SUMMARY" desc="." formatter_data="android_java">
++    Comma-separated list of domains where this script should not run.
++  </message>
++
+   <message name="IDS_ASK_TO_INSTALL" desc=". [CHAR-LIMIT=32]" formatter_data="android_java">
+     Do you want to install this user script from following location?
