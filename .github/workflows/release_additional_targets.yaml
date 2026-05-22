@@ -37,7 +37,7 @@ jobs:
           BRANCH=$(curl https://github.com/uazo/cromite/branch_commits/$CROMITE_SHA | ./pup -p li.branch:last-child a text{} | xargs)
           echo "BRANCH=$BRANCH" >> $GITHUB_ENV
 
-      - name: Checkout 'uazo/cromite'
+      - name: Checkout 'Guralt/cromite'
         uses: actions/checkout@v2
         with:
             repository: 'uazo/cromite'
