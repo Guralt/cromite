@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 'uazo/cromite SHA'
+        description: 'Guralt/cromite SHA'
         required: true
         default: ''
       type:
